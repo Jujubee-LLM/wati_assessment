@@ -17,6 +17,10 @@ MVP 目标：
 
 ## Quick Demo
 
+Demo 录屏：
+
+https://drive.google.com/file/d/18NgFbbG8i1egX7ABcWsaR8FBWQjt_6Mt/view?usp=sharing
+
 ```bash
 python3 -m wati_agent "Find all contacts tagged VIP and send them the renewal_reminder template with their name filled in"
 python3 -m wati_agent --execute "escalate 6281234567890"
