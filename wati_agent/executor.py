@@ -49,6 +49,43 @@ class Executor:
             return self.client.search_contacts_by_attribute(
                 step.args["name"], step.args["value"]
             )
+        if step.tool == "contacts.add":
+            if mutate:
+                return self.client.add_contact(
+                    step.args["whatsappNumber"],
+                    step.args["name"],
+                    step.args.get("customParams", []),
+                )
+            return ToolResult(
+                True,
+                output={"preview": True},
+                requests=[
+                    RequestRecord(
+                        "POST",
+                        f"/api/v1/addContact/{step.args['whatsappNumber']}",
+                        {
+                            "name": step.args["name"],
+                            "customParams": step.args.get("customParams", []),
+                        },
+                    )
+                ],
+            )
+        if step.tool == "contacts.update_attributes":
+            if mutate:
+                return self.client.update_contact_attributes(
+                    step.args["whatsappNumber"], step.args["customParams"]
+                )
+            return ToolResult(
+                True,
+                output={"preview": True},
+                requests=[
+                    RequestRecord(
+                        "POST",
+                        f"/api/v1/updateContactAttributes/{step.args['whatsappNumber']}",
+                        {"customParams": step.args["customParams"]},
+                    )
+                ],
+            )
         if step.tool == "tags.add":
             if mutate:
                 return self.client.add_tag(step.args["whatsappNumber"], step.args["tag"])
@@ -68,6 +105,13 @@ class Executor:
         if step.tool == "messages.send_template_batch":
             return self._send_template_batch(step.args, context, mutate=mutate)
         if step.tool == "broadcasts.send_to_segment":
+            audience_ref = step.args.get("audience_from_step")
+            if audience_ref is not None:
+                audience = context.get(audience_ref)
+                if not isinstance(audience, list):
+                    return ToolResult(False, error="Referenced audience step did not return contacts")
+                if not audience:
+                    return ToolResult(False, error="Audience is empty; broadcast skipped")
             if mutate:
                 return self.client.send_broadcast_to_segment(
                     step.args["template_name"],

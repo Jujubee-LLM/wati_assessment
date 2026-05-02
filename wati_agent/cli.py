@@ -10,7 +10,11 @@ from .client import HttpWatiClient, MockWatiClient
 from .config import load_dotenv
 from .executor import Executor, PlanValidationError
 from .models import ExecutionReport, Plan, RequestRecord, StepResult
-from .planner import make_planner
+from .planner import PlannerError, make_planner
+
+
+class ClientConfigError(Exception):
+    pass
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -30,7 +34,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--provider",
         choices=["auto", "qwen", "fallback"],
         default="auto",
-        help="Planner provider. auto uses Qwen when DASHSCOPE_API_KEY is set.",
+        help="Planner provider. Default auto uses Qwen and requires DASHSCOPE_API_KEY; fallback is explicit offline demo mode.",
     )
     parser.add_argument(
         "--json",
@@ -46,8 +50,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     instruction = " ".join(args.instruction)
-    planner = make_planner(args.provider)
-    plan = planner.plan(instruction)
+    try:
+        planner = make_planner(args.provider)
+        plan = planner.plan(instruction)
+    except PlannerError as exc:
+        if args.json:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2))
+        else:
+            print(f"Planning failed: {exc}", file=sys.stderr)
+        return 2
 
     if plan.is_clarification:
         if args.json:
@@ -56,7 +67,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Clarification needed: {plan.clarification}")
         return 2
 
-    client = _make_client(args.client)
+    try:
+        client = _make_client(args.client)
+    except ClientConfigError as exc:
+        if args.json:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2))
+        else:
+            print(f"Client configuration failed: {exc}", file=sys.stderr)
+        return 2
     executor = Executor(client=client)
     try:
         report = executor.run(plan, dry_run=not args.execute)
@@ -82,7 +100,7 @@ def _make_client(client_name: str) -> MockWatiClient | HttpWatiClient:
     token = os.getenv("WATI_TOKEN")
     base_url = os.getenv("WATI_API_BASE_URL")
     if not (tenant_id or base_url) or not token:
-        raise SystemExit(
+        raise ClientConfigError(
             "WATI_TENANT_ID or WATI_API_BASE_URL, plus WATI_TOKEN, must be set when using --client real"
         )
     return HttpWatiClient(tenant_id=base_url or tenant_id or "", token=token)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -22,8 +23,13 @@ def make_planner(provider: str = "auto") -> "Planner":
     provider = provider.lower()
     if provider == "fallback":
         return FallbackPlanner()
-    if provider in {"auto", "qwen"} and os.getenv("DASHSCOPE_API_KEY"):
-        return QwenPlanner(fallback=FallbackPlanner())
+    if provider in {"auto", "qwen"}:
+        if not os.getenv("DASHSCOPE_API_KEY"):
+            raise PlannerError(
+                "DASHSCOPE_API_KEY must be set for the default LLM planner. "
+                "Use --provider fallback only for offline deterministic demos."
+            )
+        return QwenPlanner()
     return FallbackPlanner()
 
 
@@ -40,6 +46,8 @@ class QwenPlanner(Planner):
             "DASHSCOPE_BASE_URL",
             "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
         )
+        self.timeout_seconds = _int_env("QWEN_TIMEOUT_SECONDS", default=90, minimum=1)
+        self.max_retries = _int_env("QWEN_MAX_RETRIES", default=2, minimum=1)
         self.fallback = fallback
 
     def plan(self, instruction: str) -> Plan:
@@ -62,24 +70,37 @@ class QwenPlanner(Planner):
                 {"role": "user", "content": instruction},
             ],
         }
-        request = urllib.request.Request(
-            self.endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.URLError as exc:
-            raise PlannerError(str(exc)) from exc
+        raw = self._post_chat_completion(payload)
 
         data = json.loads(raw)
         content = data["choices"][0]["message"]["content"]
         return normalize_plan(instruction, plan_from_dict(_json_from_text(content)))
+
+    def _post_chat_completion(self, payload: JsonDict) -> str:
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            request = urllib.request.Request(
+                self.endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=self.timeout_seconds
+                ) as response:
+                    return response.read().decode("utf-8")
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    time.sleep(1)
+        raise PlannerError(
+            f"{last_error} after {self.max_retries} attempt(s); "
+            "set QWEN_TIMEOUT_SECONDS to a larger value if the model is slow"
+        )
 
     def _system_prompt(self) -> str:
         return (
@@ -94,7 +115,11 @@ class QwenPlanner(Planner):
             "- For VIP renewal, first use contacts.search_by_tag with tag='VIP', then "
             "messages.send_template_batch with template_name='renewal_reminder'.\n"
             "- For flash_sale Jakarta campaign, use broadcasts.send_to_segment with "
-            "template_name='flash_sale' and segmentName='city=Jakarta'.\n\n"
+            "template_name='flash_sale' and segmentName='city=Jakarta' after a "
+            "contacts.search_by_attribute step for name='city' and value='Jakarta'.\n"
+            "- For create/update contact or add tag requests, return a concrete plan "
+            "with contacts.add, contacts.update_attributes, and/or tags.add, or ask "
+            "for missing fields.\n\n"
             "Allowed tools:\n"
             f"{json.dumps(tool_schema_for_prompt(), ensure_ascii=False, indent=2)}\n\n"
             "Return one of these JSON shapes:\n"
@@ -156,19 +181,121 @@ class FallbackPlanner(Planner):
         if "flash_sale" in lowered and ("jakarta" in lowered or "city" in lowered):
             city = self._extract_city(normalized) or "Jakarta"
             return Plan(
-                summary=f"Send flash_sale broadcast to city={city} segment",
+                summary=f"Verify city={city} audience and send flash_sale broadcast",
                 requires_confirmation=True,
                 steps=[
+                    PlanStep(
+                        "contacts.search_by_attribute",
+                        {"name": "city", "value": city},
+                    ),
                     PlanStep(
                         "broadcasts.send_to_segment",
                         {
                             "template_name": "flash_sale",
                             "broadcast_name": f"flash_sale_{city.lower()}",
                             "segmentName": f"city={city}",
+                            "audience_from_step": 1,
                         },
-                    )
+                    ),
                 ],
             )
+
+        if ("create" in lowered or "add contact" in lowered or "new contact" in lowered) and "contact" in lowered:
+            number = self._extract_number(normalized)
+            name = self._extract_name(normalized)
+            custom_params = self._extract_custom_params(normalized)
+            tag = self._extract_tag(normalized)
+            if number and name:
+                steps = [
+                    PlanStep(
+                        "contacts.add",
+                        {
+                            "whatsappNumber": number,
+                            "name": name,
+                            "customParams": custom_params,
+                        },
+                    )
+                ]
+                if tag:
+                    steps.append(
+                        PlanStep(
+                            "tags.add",
+                            {"whatsappNumber": number, "tag": tag},
+                        )
+                    )
+                return Plan(
+                    summary=f"Create contact {name} and apply requested attributes",
+                    requires_confirmation=True,
+                    steps=steps,
+                )
+            return Plan(
+                summary="Need contact details",
+                steps=[],
+                clarification="What WhatsApp number and contact name should be used?",
+            )
+
+        if "update" in lowered and ("attribute" in lowered or "city" in lowered):
+            number = self._extract_number(normalized)
+            custom_params = self._extract_custom_params(normalized)
+            if number and custom_params:
+                return Plan(
+                    summary=f"Update attributes for {number}",
+                    requires_confirmation=True,
+                    steps=[
+                        PlanStep(
+                            "contacts.update_attributes",
+                            {
+                                "whatsappNumber": number,
+                                "customParams": custom_params,
+                            },
+                        )
+                    ],
+                )
+            return Plan(
+                summary="Need attribute details",
+                steps=[],
+                clarification="Which WhatsApp number and attributes should be updated?",
+            )
+
+        if "tag" in lowered and ("add" in lowered or "tag" in lowered):
+            number = self._extract_number(normalized)
+            tag = self._extract_tag(normalized)
+            if number and tag:
+                return Plan(
+                    summary=f"Add {tag} tag to {number}",
+                    requires_confirmation=True,
+                    steps=[
+                        PlanStep(
+                            "tags.add",
+                            {"whatsappNumber": number, "tag": tag},
+                        )
+                    ],
+                )
+            if "contact" in lowered:
+                return Plan(
+                    summary="Need tag details",
+                    steps=[],
+                    clarification="Which WhatsApp number and tag should be used?",
+                )
+
+        if ("send" in lowered or "message" in lowered) and self._extract_number(normalized):
+            number = self._extract_number(normalized)
+            template = self._extract_template(normalized)
+            if template and number:
+                return Plan(
+                    summary=f"Send {template} template to {number}",
+                    requires_confirmation=True,
+                    steps=[
+                        PlanStep(
+                            "messages.send_template",
+                            {
+                                "whatsappNumber": number,
+                                "template_name": template,
+                                "broadcast_name": f"{template}_direct",
+                            },
+                        )
+                    ],
+                )
 
         if "send" in lowered and "template" in lowered:
             return Plan(
@@ -200,6 +327,43 @@ class FallbackPlanner(Planner):
             return "Jakarta"
         return None
 
+    def _extract_tag(self, text: str) -> str | None:
+        match = re.search(r"tag(?:ged)?\s+['\"]?([A-Za-z0-9_-]+)['\"]?", text, re.I)
+        if match:
+            return match.group(1)
+        match = re.search(r"add\s+['\"]?([A-Za-z0-9_-]+)['\"]?\s+tag", text, re.I)
+        if match:
+            return match.group(1)
+        return None
+
+    def _extract_template(self, text: str) -> str | None:
+        match = re.search(r"template\s+['\"]?([A-Za-z0-9_-]+)['\"]?", text, re.I)
+        if match:
+            return match.group(1)
+        match = re.search(r"['\"]([A-Za-z0-9_-]+)['\"]\s+template", text, re.I)
+        if match:
+            return match.group(1)
+        return None
+
+    def _extract_name(self, text: str) -> str | None:
+        match = re.search(r"(?:named|name\s*=?|for)\s+['\"]?([A-Z][A-Za-z\s-]{1,40})['\"]?", text)
+        if match:
+            return match.group(1).strip().split()[0]
+        match = re.search(r"contact\s+['\"]?([A-Z][A-Za-z\s-]{1,40})['\"]?", text)
+        if match:
+            return match.group(1).strip().split()[0]
+        return None
+
+    def _extract_custom_params(self, text: str) -> list[JsonDict]:
+        params: list[JsonDict] = []
+        city = self._extract_city(text)
+        if city:
+            params.append({"name": "city", "value": city})
+        for key, value in re.findall(r"attribute\s+['\"]?([A-Za-z0-9_-]+)['\"]?\s*=\s*['\"]?([A-Za-z0-9_-]+)['\"]?", text, re.I):
+            if key.lower() != "city":
+                params.append({"name": key, "value": value})
+        return params
+
 
 def plan_from_dict(data: JsonDict) -> Plan:
     steps = [
@@ -228,7 +392,7 @@ def _json_from_text(text: str) -> JsonDict:
         data = json.loads(match.group(0))
     if not isinstance(data, dict):
         raise PlannerError("Planner response must be a JSON object")
-        return data
+    return data
 
 
 def normalize_plan(instruction: str, plan: Plan) -> Plan:
@@ -238,7 +402,7 @@ def normalize_plan(instruction: str, plan: Plan) -> Plan:
     differences from breaking the fixed demo workflows.
     """
     lowered = instruction.lower()
-    steps = list(plan.steps)
+    steps = [_normalize_step_args(step) for step in plan.steps]
 
     if "escalate" in lowered:
         number = FallbackPlanner()._extract_number(instruction)
@@ -288,4 +452,67 @@ def normalize_plan(instruction: str, plan: Plan) -> Plan:
                 clarification=plan.clarification,
             )
 
-    return plan
+    if "flash_sale" in lowered and ("jakarta" in lowered or "city" in lowered):
+        city = FallbackPlanner()._extract_city(instruction) or "Jakarta"
+        steps = [
+            PlanStep("contacts.search_by_attribute", {"name": "city", "value": city}),
+            PlanStep(
+                "broadcasts.send_to_segment",
+                {
+                    "template_name": "flash_sale",
+                    "broadcast_name": f"flash_sale_{city.lower()}",
+                    "segmentName": f"city={city}",
+                    "audience_from_step": 1,
+                },
+            ),
+        ]
+        return Plan(
+            summary=f"Verify city={city} audience and send flash_sale broadcast",
+            requires_confirmation=True,
+            steps=steps,
+            clarification=plan.clarification,
+        )
+
+    return Plan(
+        summary=plan.summary,
+        requires_confirmation=plan.requires_confirmation,
+        steps=steps,
+        clarification=plan.clarification,
+    )
+
+
+def _normalize_step_args(step: PlanStep) -> PlanStep:
+    args = dict(step.args)
+    if step.tool in {"contacts.add", "contacts.update_attributes"}:
+        args["customParams"] = _normalize_custom_params(args.get("customParams", []))
+    return PlanStep(step.tool, args)
+
+
+def _normalize_custom_params(value: object) -> list[JsonDict]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [
+            {"name": str(name), "value": str(param_value)}
+            for name, param_value in value.items()
+        ]
+    if isinstance(value, list):
+        normalized: list[JsonDict] = []
+        for item in value:
+            if isinstance(item, dict) and "name" in item and "value" in item:
+                normalized.append(
+                    {"name": str(item["name"]), "value": str(item["value"])}
+                )
+        return normalized
+    return []
+
+
+def _int_env(name: str, default: int, minimum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(value, minimum)

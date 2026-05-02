@@ -25,6 +25,7 @@ https://drive.google.com/file/d/18NgFbbG8i1egX7ABcWsaR8FBWQjt_6Mt/view?usp=shari
 python3 -m wati_agent "Find all contacts tagged VIP and send them the renewal_reminder template with their name filled in"
 python3 -m wati_agent --execute "escalate 6281234567890"
 python3 -m wati_agent "Send a broadcast with the flash_sale template to all contacts who have city = Jakarta"
+python3 -m wati_agent --execute "Create a new contact for Alice with phone 6289999999999 city = Jakarta and add tag lead"
 ```
 
 Default mode is dry-run. Mutating actions require explicit `--execute`.
@@ -32,10 +33,18 @@ Default mode is dry-run. Mutating actions require explicit `--execute`.
 Example dry-run preview:
 
 ```text
-[Dry Run] Will execute 2 steps:
-1. GET /api/v1/getContacts?tag=VIP
-2. POST /api/v2/sendTemplateMessage/{whatsappNumber}
-Use --execute to run.
+Intent understood:
+Send renewal_reminder template to VIP contacts
+
+Execution mode:
+Dry run. No side-effecting API calls executed.
+
+Planned WATI API calls:
+1. contacts.search_by_tag
+   GET /api/v1/getContacts?tag=VIP
+2. messages.send_template_batch
+   POST /api/v2/sendTemplateMessage/6281111111111
+   POST /api/v2/sendTemplateMessage/6282222222222
 ```
 
 ## Setup
@@ -46,11 +55,13 @@ No third-party dependency is required for the deterministic demo path.
 python3 --version
 ```
 
-Optional Qwen/DashScope configuration:
+Required Qwen/DashScope configuration for the default LLM-backed path:
 
 ```bash
 export DASHSCOPE_API_KEY="your_dashscope_key"
 export QWEN_MODEL="qwen-plus"
+export QWEN_TIMEOUT_SECONDS="90"
+export QWEN_MAX_RETRIES="2"
 ```
 
 You can also create a local `.env` file. It is ignored by git:
@@ -58,9 +69,12 @@ You can also create a local `.env` file. It is ignored by git:
 ```bash
 DASHSCOPE_API_KEY=your_dashscope_key
 QWEN_MODEL=qwen-plus
+QWEN_TIMEOUT_SECONDS=90
+QWEN_MAX_RETRIES=2
 ```
 
-Without an API key, the CLI uses a deterministic fallback planner so the demo remains reproducible.
+By default, the CLI uses the Qwen LLM planner and fails clearly if `DASHSCOPE_API_KEY` is not configured. The deterministic fallback planner is still available, but only when explicitly requested with `--provider fallback` for offline demos and tests.
+If the model endpoint is slow during review, increase `QWEN_TIMEOUT_SECONDS`; the planner retries transient network timeouts and still never silently falls back to the deterministic parser.
 
 ## Run
 
@@ -76,7 +90,7 @@ Execute through the configured client:
 python3 -m wati_agent --execute "escalate 6281234567890"
 ```
 
-Force deterministic fallback planning:
+Offline deterministic demo path:
 
 ```bash
 python3 -m wati_agent --provider fallback "escalate 6281234567890"
@@ -90,11 +104,12 @@ python3 -m wati_agent --json "send a template"
 
 ## Demo Scenarios
 
-The demo supports three end-to-end scenarios:
+The demo supports four end-to-end scenarios:
 
 - `VIP renewal`: find contacts tagged `VIP`, then send each one the `renewal_reminder` template.
 - `Escalation`: when the user says `escalate 6281234567890`, assign the conversation to `Support` and add the `escalated` tag.
-- `City campaign`: send the `flash_sale` broadcast to the `city=Jakarta` segment.
+- `City campaign`: verify contacts with `city=Jakarta`, then send the `flash_sale` broadcast to that segment.
+- `Contact onboarding`: create a contact with custom attributes, then add a tag.
 
 These scenarios cover Contacts, Tags, Messages, Broadcasts, and Tickets.
 
@@ -112,7 +127,7 @@ CLI -> Planner -> Plan Validator -> Executor -> WATI Client
 
 ### Planner
 
-The planner uses Qwen or a deterministic fallback parser to convert natural language into a structured JSON plan. The LLM never calls APIs directly.
+The default planner uses Qwen to convert natural language into a structured JSON plan. A deterministic fallback parser exists only for explicit offline demo and test runs. The LLM never calls APIs directly.
 
 Example plan:
 
@@ -147,6 +162,8 @@ Initial tools:
 
 - `contacts.search_by_tag`
 - `contacts.search_by_attribute`
+- `contacts.add`
+- `contacts.update_attributes`
 - `tags.add`
 - `messages.send_template`
 - `messages.send_template_batch`
@@ -174,7 +191,7 @@ The submitted demo uses `MockWatiClient`, which is allowed by the assignment. It
 ### Execution Flow
 
 1. CLI receives a natural-language instruction.
-2. Planner generates a structured plan with Qwen or fallback parsing.
+2. Planner generates a structured plan with Qwen; missing LLM credentials fail fast instead of silently using non-LLM parsing.
 3. Plan Validator checks tool names, required arguments, and step references.
 4. Executor prints a dry-run preview by default.
 5. With `--execute`, Executor calls the configured WATI client.
@@ -211,6 +228,8 @@ V1 uses a focused subset of the provided WATI API reference:
 
 - `GET /api/v1/getContacts?tag={tag}`
 - `GET /api/v1/getContacts`
+- `POST /api/v1/addContact/{whatsappNumber}`
+- `POST /api/v1/updateContactAttributes/{whatsappNumber}`
 - `POST /api/v1/addTag/{whatsappNumber}`
 - `POST /api/v2/sendTemplateMessage/{whatsappNumber}`
 - `POST /api/v1/sendBroadcastToSegment`
@@ -218,7 +237,7 @@ V1 uses a focused subset of the provided WATI API reference:
 
 ## AI/LLM Usage
 
-Qwen is used for intent understanding and plan generation when `DASHSCOPE_API_KEY` is configured.
+Qwen is the default LLM integration for intent understanding and plan generation.
 
 Why Qwen:
 
@@ -226,17 +245,22 @@ Why Qwen:
 - It can produce structured JSON plans for lightweight orchestration tasks.
 - It keeps the architecture model-agnostic because execution is not coupled to the LLM provider.
 
-The deterministic fallback planner exists for demo reliability and testing. It is not a replacement for the LLM path; it prevents external API availability from blocking the walkthrough.
+The deterministic fallback planner exists for demo reliability and testing. It is not presented as an LLM replacement; the normal review path is:
+
+```bash
+python3 -m wati_agent "Find all contacts tagged VIP and send them the renewal_reminder template with their name filled in"
+```
 
 ## Error Handling
 
 The system fails clearly instead of guessing silently.
 
 - Missing parameters return a concrete clarification request.
-- Unknown tools or missing required arguments fail validation before execution.
+- Unknown tools, missing required arguments, invalid phone numbers, and malformed template/attribute parameters fail validation before execution.
 - Batch sends continue across independent contacts and summarize partial failures.
 - API/client errors are reported per step.
 - Side-effecting operations require explicit `--execute`.
+- The real HTTP adapter paginates contact reads for attribute searches and retries transient API failures.
 
 ## Testability
 
@@ -251,7 +275,11 @@ The tests cover:
 - VIP renewal planning and batch expansion.
 - Escalation planning and execution.
 - City broadcast planning.
+- Contact creation plus tagging.
 - Clarification flow for incomplete instructions.
+- Parameter validation for malformed plans.
+- HTTP contact pagination behavior.
+- Qwen planner response parsing and normalization without calling the network.
 
 ## Build Notes
 
@@ -261,7 +289,7 @@ The tests cover:
 | 20-50 min | Tool schema, mock data, `MockWatiClient` |
 | 50-90 min | Qwen planner, fallback planner, plan validation |
 | 90-125 min | Executor, dry-run, execute mode, error handling |
-| 125-155 min | Three demo scenarios working end-to-end |
+| 125-155 min | Multi-domain demo scenarios working end-to-end |
 | 155-175 min | Unit tests, README, demo script |
 | 175-180 min | Compile, test, and demo command verification |
 
@@ -274,11 +302,11 @@ Priorities:
 
 Deliberate scope cuts:
 
-- Full WATI API coverage: V1 implements only the subset needed for the demo.
+- Full WATI API coverage: V1 implements only the subset needed for the demo, including contact create/update, tagging, template messages, broadcasts, and ticket assignment.
 - Web UI: CLI best fits the 3-hour timebox and keeps attention on orchestration.
 - Persistent database: mock data is enough for an end-to-end demo.
 - Full rollback engine: dry-run and per-step reporting reduce risk; rollback is a V2 feature.
-- Large-scale queue/rate-limit scheduler: current batch handling demonstrates the design direction.
+- Large-scale queue/rate-limit scheduler: current batch handling, contact pagination, and transient retry support demonstrate the design direction.
 
 ## Trade-offs
 
@@ -296,11 +324,11 @@ The LLM is valuable for intent parsing, but deterministic code must own validati
 
 ## Compliance with WATI Assignment Requirements
 
-- LLM used for intent understanding and plan generation.
-- Multi-domain API orchestration across Contacts, Tags, Messages, Broadcasts, and Tickets.
+- Qwen LLM integration is the default path for intent understanding and plan generation; offline fallback is explicit and clearly separated for deterministic demos.
+- Multi-domain API orchestration across Contacts, Tags, Messages, Broadcasts, and Tickets, including every README demo scenario.
 - Dry-run / preview by default.
 - Realistic mock client with swappable real API adapter.
-- Plan validation and explicit error handling.
+- Plan validation, parameter validation, pagination-aware contact lookup, retry, and explicit error handling.
 - 3-hour timebox compliant scope.
 - Clear README with run steps, architecture, AI usage, build notes, trade-offs, and V2 roadmap.
 
@@ -311,5 +339,5 @@ The LLM is valuable for intent parsing, but deterministic code must own validati
 - Add conversational memory within a session.
 - Add interactive confirmation prompts for risky actions.
 - Add persistent audit logs.
-- Add retry, pagination, and rate-limit handling.
+- Add a fuller rate-limit queue, rollback handling, and operator/template metadata handling.
 - Provide a lightweight chat web UI.

@@ -22,7 +22,7 @@ class MockWatiClient:
     def search_contacts_by_tag(self, tag: str) -> ToolResult:
         request = RequestRecord("GET", f"/api/v1/getContacts?tag={tag}")
         matches = [contact for contact in self.contacts if tag in contact["tags"]]
-        return ToolResult(ok=True, output=matches, requests=[request])
+        return ToolResult(ok=True, output=deepcopy(matches), requests=[request])
 
     def search_contacts_by_attribute(self, name: str, value: str) -> ToolResult:
         request = RequestRecord("GET", "/api/v1/getContacts")
@@ -31,7 +31,39 @@ class MockWatiClient:
             for contact in self.contacts
             if str(contact.get("customParams", {}).get(name, "")).lower() == value.lower()
         ]
-        return ToolResult(ok=True, output=matches, requests=[request])
+        return ToolResult(ok=True, output=deepcopy(matches), requests=[request])
+
+    def add_contact(
+        self,
+        whatsapp_number: str,
+        name: str,
+        custom_params: list[JsonDict] | None = None,
+    ) -> ToolResult:
+        body = {"name": name, "customParams": custom_params or []}
+        request = RequestRecord("POST", f"/api/v1/addContact/{whatsapp_number}", body)
+        if self._find_contact(whatsapp_number):
+            return ToolResult(False, requests=[request], error="Contact already exists")
+        contact = {
+            "whatsappNumber": whatsapp_number,
+            "name": name,
+            "tags": [],
+            "customParams": _custom_params_to_dict(custom_params or []),
+        }
+        self.contacts.append(contact)
+        return ToolResult(True, output=deepcopy(contact), requests=[request])
+
+    def update_contact_attributes(
+        self, whatsapp_number: str, custom_params: list[JsonDict]
+    ) -> ToolResult:
+        body = {"customParams": custom_params}
+        request = RequestRecord(
+            "POST", f"/api/v1/updateContactAttributes/{whatsapp_number}", body
+        )
+        contact = self._find_contact(whatsapp_number)
+        if not contact:
+            return ToolResult(False, requests=[request], error="Contact not found")
+        contact.setdefault("customParams", {}).update(_custom_params_to_dict(custom_params))
+        return ToolResult(True, output=deepcopy(contact), requests=[request])
 
     def add_tag(self, whatsapp_number: str, tag: str) -> ToolResult:
         request = RequestRecord(
@@ -42,7 +74,7 @@ class MockWatiClient:
             return ToolResult(False, requests=[request], error="Contact not found")
         if tag not in contact["tags"]:
             contact["tags"].append(tag)
-        return ToolResult(True, output=contact, requests=[request])
+        return ToolResult(True, output=deepcopy(contact), requests=[request])
 
     def send_template_message(
         self,
@@ -123,8 +155,7 @@ class HttpWatiClient:
         return self._request("GET", endpoint, normalizer=_normalize_contacts)
 
     def search_contacts_by_attribute(self, name: str, value: str) -> ToolResult:
-        endpoint = "/api/v1/getContacts?pageSize=100&pageNumber=1"
-        result = self._request("GET", endpoint, normalizer=_normalize_contacts)
+        result = self._get_all_contacts()
         if not result.ok or not isinstance(result.output, list):
             return result
         matches = [
@@ -133,6 +164,22 @@ class HttpWatiClient:
             if _custom_param_value(contact, name).lower() == value.lower()
         ]
         return ToolResult(ok=True, output=matches, requests=result.requests)
+
+    def add_contact(
+        self,
+        whatsapp_number: str,
+        name: str,
+        custom_params: list[JsonDict] | None = None,
+    ) -> ToolResult:
+        endpoint = f"/api/v1/addContact/{urllib.parse.quote(whatsapp_number)}"
+        body = {"name": name, "customParams": custom_params or []}
+        return self._request("POST", endpoint, body)
+
+    def update_contact_attributes(
+        self, whatsapp_number: str, custom_params: list[JsonDict]
+    ) -> ToolResult:
+        endpoint = f"/api/v1/updateContactAttributes/{urllib.parse.quote(whatsapp_number)}"
+        return self._request("POST", endpoint, {"customParams": custom_params})
 
     def add_tag(self, whatsapp_number: str, tag: str) -> ToolResult:
         endpoint = f"/api/v1/addTag/{urllib.parse.quote(whatsapp_number)}"
@@ -167,6 +214,20 @@ class HttpWatiClient:
         body = {"whatsappNumber": whatsapp_number, "teamName": team_name}
         return self._request("POST", "/api/v1/tickets/assign", body)
 
+    def _get_all_contacts(self, page_size: int = 100, max_pages: int = 20) -> ToolResult:
+        requests: list[RequestRecord] = []
+        contacts: list[JsonDict] = []
+        for page_number in range(1, max_pages + 1):
+            endpoint = f"/api/v1/getContacts?pageSize={page_size}&pageNumber={page_number}"
+            result = self._request("GET", endpoint, normalizer=_normalize_contacts)
+            requests.extend(result.requests)
+            if not result.ok or not isinstance(result.output, list):
+                return ToolResult(False, output=contacts, requests=requests, error=result.error)
+            contacts.extend(result.output)
+            if len(result.output) < page_size:
+                break
+        return ToolResult(True, output=contacts, requests=requests)
+
     def _request(
         self,
         method: str,
@@ -185,20 +246,23 @@ class HttpWatiClient:
                 "Content-Type": "application/json",
             },
         )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                payload = _decode_response(response.read())
-                output = normalizer(payload) if normalizer else payload
-                return ToolResult(True, output=output, requests=[request_record])
-        except urllib.error.HTTPError as exc:
-            message = _decode_error(exc)
-            return ToolResult(
-                False,
-                requests=[request_record],
-                error=f"HTTP {exc.code}: {message}",
-            )
-        except urllib.error.URLError as exc:
-            return ToolResult(False, requests=[request_record], error=str(exc))
+        last_error = ""
+        for attempt in range(1, 4):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    payload = _decode_response(response.read())
+                    output = normalizer(payload) if normalizer else payload
+                    return ToolResult(True, output=output, requests=[request_record])
+            except urllib.error.HTTPError as exc:
+                message = _decode_error(exc)
+                last_error = f"HTTP {exc.code}: {message}"
+                if exc.code not in {429, 500, 502, 503, 504}:
+                    break
+            except urllib.error.URLError as exc:
+                last_error = str(exc)
+            if attempt == 3:
+                break
+        return ToolResult(False, requests=[request_record], error=last_error)
 
 
 def _decode_response(raw: bytes) -> object:
@@ -256,3 +320,11 @@ def _custom_param_value(contact: JsonDict, name: str) -> str:
             if isinstance(item, dict) and item.get("name") == name:
                 return str(item.get("value", ""))
     return ""
+
+
+def _custom_params_to_dict(custom_params: list[JsonDict]) -> JsonDict:
+    return {
+        str(item["name"]): str(item["value"])
+        for item in custom_params
+        if "name" in item and "value" in item
+    }
